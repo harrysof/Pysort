@@ -1,5 +1,6 @@
 """
 MediaSort — sorts images, videos, documents, and audio into organised sub-folders.
+             Includes an AI Rename tab powered by a local GGUF model via llama-server.
 
 ┌─────────────────────────────────────────────────────────────────┐
 │  IMAGE categories  (checked in priority order)                  │
@@ -30,15 +31,26 @@ MediaSort — sorts images, videos, documents, and audio into organised sub-fold
 │   2. Compressed      → .mp3 .aac .ogg .opus .m4a .wma .ac3 ... │
 │   3. Playlists       → .m3u .m3u8 .pls .xspf .wpl              │
 │   4. Other Audio     → everything else                          │
+├─────────────────────────────────────────────────────────────────┤
+│  AI RENAME  (supported: .txt .pdf .docx .pptx)                 │
+│   • Reads each file page-by-page with the best library          │
+│   • Sends page summaries to a local llama-server (GGUF/Vulkan)  │
+│   • Model suggests a short filename in the document's language  │
+│   • User reviews suggestions and applies renames with one click │
+│   • llama-server endpoint configurable in the UI                │
 └─────────────────────────────────────────────────────────────────┘
 
 Dependencies:
   tkinter            — GUI (stdlib, bundled with Python on Windows)
   threading          — background scan (stdlib)
-  os, pathlib, shutil, math, subprocess, json  (stdlib)
-  Pillow             — image dimensions  (pip install Pillow)
-  ffprobe (on PATH)  — video dimensions  (or opencv-python as fallback)
-  opencv-python      — optional fallback  (pip install opencv-python)
+  os, pathlib, shutil, math, subprocess, json, urllib  (stdlib)
+  Pillow             — image dimensions        (pip install Pillow)
+  ffprobe (on PATH)  — video dimensions        (or opencv-python as fallback)
+  opencv-python      — optional fallback       (pip install opencv-python)
+  pypdf              — PDF text extraction     (pip install pypdf)
+  python-docx        — Word text extraction    (pip install python-docx)
+  python-pptx        — PowerPoint extraction   (pip install python-pptx)
+  llama-server       — local GGUF inference    (llama.cpp Vulkan build on PATH)
 """
 
 import os
@@ -47,6 +59,8 @@ import math
 import shutil
 import subprocess
 import threading
+import urllib.request
+import urllib.error
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -56,6 +70,24 @@ try:
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
+
+try:
+    import pypdf as _pypdf
+    _PYPDF_AVAILABLE = True
+except ImportError:
+    _PYPDF_AVAILABLE = False
+
+try:
+    from docx import Document as _DocxDocument
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
+
+try:
+    from pptx import Presentation as _PptxPresentation
+    _PPTX_AVAILABLE = True
+except ImportError:
+    _PPTX_AVAILABLE = False
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -100,6 +132,12 @@ PALETTE = {
     "lossy":     "#80cbc4",   # teal         — compressed audio
     "playlist":  "#b39ddb",   # purple       — playlists
     "aud_other": "#f48fb1",   # pink         — other audio
+    # ai rename colours
+    "ai":        "#c792ea",   # violet       — AI rename accent
+    "ai_ok":     "#43e8a0",   # green        — suggestion accepted
+    "ai_skip":   "#888898",   # grey         — skipped
+    "ai_err":    "#ff6584",   # red          — error
+    "ai_pend":   "#ffd166",   # amber        — pending
 }
 
 
@@ -1035,6 +1073,657 @@ class AudioSorterPanel(_SorterPanel):
 
 
 # ══════════════════════════════════════════════════════════════════
+# AI RENAME — text extraction helpers
+# ══════════════════════════════════════════════════════════════════
+
+AI_RENAME_EXTENSIONS = {".txt", ".pdf", ".docx", ".pptx"}
+
+# Max chars extracted per page sent to the model — keeps context short
+_PAGE_CHARS = 1200
+# Max pages to summarise per file — avoid overloading context
+_MAX_PAGES  = 30
+
+
+def _extract_pages_txt(path: Path) -> list[str]:
+    """Plain text: treat every 3 000 chars as a logical 'page'."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    chunk = 3000
+    return [text[i:i+chunk] for i in range(0, len(text), chunk)] or [""]
+
+
+def _extract_pages_pdf(path: Path) -> list[str]:
+    if not _PYPDF_AVAILABLE:
+        raise RuntimeError("pypdf not installed. Run: pip install pypdf")
+    pages = []
+    reader = _pypdf.PdfReader(str(path))
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+    return pages or [""]
+
+
+def _extract_pages_docx(path: Path) -> list[str]:
+    if not _DOCX_AVAILABLE:
+        raise RuntimeError("python-docx not installed. Run: pip install python-docx")
+    doc = _DocxDocument(str(path))
+    # Group paragraphs into logical pages (~40 paragraphs each)
+    paras = [p.text for p in doc.paragraphs if p.text.strip()]
+    chunk = 40
+    return ["\n".join(paras[i:i+chunk]) for i in range(0, len(paras), chunk)] or [""]
+
+
+def _extract_pages_pptx(path: Path) -> list[str]:
+    if not _PPTX_AVAILABLE:
+        raise RuntimeError("python-pptx not installed. Run: pip install python-pptx")
+    prs = _PptxPresentation(str(path))
+    pages = []
+    for slide in prs.slides:
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                texts.append(shape.text_frame.text)
+        pages.append("\n".join(texts))
+    return pages or [""]
+
+
+def extract_pages(path: Path) -> list[str]:
+    """Dispatch to the right extractor based on extension."""
+    ext = path.suffix.lower()
+    if ext == ".txt" or ext in (".md", ".rst", ".log"):
+        return _extract_pages_txt(path)
+    elif ext == ".pdf":
+        return _extract_pages_pdf(path)
+    elif ext == ".docx":
+        return _extract_pages_docx(path)
+    elif ext == ".pptx":
+        return _extract_pages_pptx(path)
+    else:
+        raise ValueError(f"Unsupported extension for AI rename: {ext}")
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text.strip()
+    return text[:max_chars].strip() + "…"
+
+
+# ══════════════════════════════════════════════════════════════════
+# AI RENAME — llama-server client
+# ══════════════════════════════════════════════════════════════════
+
+def _llama_complete(endpoint: str, prompt: str, max_tokens: int = 80) -> str:
+    """
+    POST to llama-server /completion endpoint.
+    endpoint example: "http://127.0.0.1:8000"
+    """
+    url     = endpoint.rstrip("/") + "/completion"
+    payload = json.dumps({
+        "prompt":      prompt,
+        "n_predict":   max_tokens,
+        "temperature": 0.2,
+        "top_p":       0.9,
+        "stop":        ["\n", "```", "<|", "###"],
+    }).encode()
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return data.get("content", "").strip()
+
+
+def _build_rename_prompt(pages: list[str], original_name: str) -> str:
+    """
+    Build the prompt that asks the model for a short filename suggestion.
+    Page texts are truncated and joined as a numbered list.
+    """
+    page_summaries = []
+    for i, text in enumerate(pages[:_MAX_PAGES], 1):
+        snippet = _truncate(text, _PAGE_CHARS)
+        if snippet:
+            page_summaries.append(f"[Page {i}]\n{snippet}")
+
+    joined = "\n\n".join(page_summaries)
+
+    prompt = (
+        "You are a file-naming assistant. "
+        "Read the document content below and suggest ONE short, descriptive filename "
+        "(without extension, without quotes, no special characters except hyphens and underscores, "
+        "max 6 words, use the same language as the document). "
+        "Reply with ONLY the filename, nothing else.\n\n"
+        f"Original filename: {original_name}\n\n"
+        f"Document content:\n{joined}\n\n"
+        "Suggested filename:"
+    )
+    return prompt
+
+
+def _sanitize_suggested_name(raw: str) -> str:
+    """Strip forbidden filename chars, collapse spaces to underscores."""
+    # Remove characters Windows/Linux forbid in filenames
+    for ch in r'\/:*?"<>|':
+        raw = raw.replace(ch, "")
+    raw = raw.strip().strip("'\".")
+    # Collapse multiple spaces/underscores
+    import re
+    raw = re.sub(r"[\s_]+", "_", raw)
+    raw = re.sub(r"-+", "-", raw)
+    return raw[:80]  # hard cap
+
+
+def ai_rename_file(filepath: Path, endpoint: str) -> str:
+    """
+    Full pipeline: extract pages → build prompt → call model → return clean name.
+    Raises on any failure so the caller can surface the error.
+    """
+    pages       = extract_pages(filepath)
+    prompt      = _build_rename_prompt(pages, filepath.name)
+    raw         = _llama_complete(endpoint, prompt)
+    suggestion  = _sanitize_suggested_name(raw)
+    if not suggestion:
+        raise ValueError("Model returned an empty suggestion.")
+    return suggestion
+
+
+# ══════════════════════════════════════════════════════════════════
+# AI RENAME — panel
+# ══════════════════════════════════════════════════════════════════
+
+# Row states
+_ST_PENDING  = "pending"
+_ST_RUNNING  = "running"
+_ST_DONE     = "done"
+_ST_ERROR    = "error"
+_ST_SKIPPED  = "skipped"
+_ST_RENAMED  = "renamed"
+
+_STATE_COLORS = {
+    _ST_PENDING:  PALETTE["ai_pend"],
+    _ST_RUNNING:  PALETTE["ai"],
+    _ST_DONE:     PALETTE["ai_ok"],
+    _ST_ERROR:    PALETTE["ai_err"],
+    _ST_SKIPPED:  PALETTE["ai_skip"],
+    _ST_RENAMED:  PALETTE["ai_ok"],
+}
+_STATE_ICONS = {
+    _ST_PENDING:  "⏳",
+    _ST_RUNNING:  "🤖",
+    _ST_DONE:     "✅",
+    _ST_ERROR:    "❌",
+    _ST_SKIPPED:  "⏭",
+    _ST_RENAMED:  "✔",
+}
+
+
+class AiRenamePanel(tk.Frame):
+    """
+    Standalone tab for AI-powered filename suggestions.
+
+    Workflow:
+      1. User picks a folder (or individual files via Browse).
+      2. App scans for .txt / .pdf / .docx / .pptx files.
+      3. User clicks "Analyse" — each file is sent through the
+         extract → prompt → llama-server pipeline in a background thread.
+      4. Results appear in a table: original name | suggested name | status.
+      5. User can edit any suggestion inline, check/uncheck rows,
+         then click "Apply Renames" to do the actual os.rename calls.
+    """
+
+    _COL_CHECK  = "✔"
+    _COL_ORIG   = "Original filename"
+    _COL_SUGG   = "Suggested name"
+    _COL_STATUS = "Status"
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=PALETTE["bg"])
+        self._rows: list[dict] = []   # {path, suggestion, state, var(BooleanVar), iid}
+        self._running  = False
+        self._stop_evt = threading.Event()
+        self._status   = tk.StringVar(value="Pick a folder or files to begin.")
+        self._progress = tk.DoubleVar(value=0.0)
+        self._endpoint = tk.StringVar(value="http://127.0.0.1:8000")
+        self._build_ui()
+
+    # ── UI construction ───────────────────────
+
+    def _build_ui(self):
+        # ── Header strip ─────────────────────
+        hdr = tk.Frame(self, bg=PALETTE["panel"])
+        hdr.pack(fill="x", padx=20, pady=(14, 0), ipady=10)
+
+        tk.Label(hdr, text="🤖  AI Rename",
+                 font=("Segoe UI", 13, "bold"),
+                 fg=PALETTE["ai"], bg=PALETTE["panel"]).pack(side="left", padx=(14, 6))
+        tk.Label(hdr, text="· reads each page · suggests a filename · you decide",
+                 font=("Segoe UI", 9),
+                 fg=PALETTE["subtext"], bg=PALETTE["panel"]).pack(side="left", pady=(3, 0))
+
+        # ── Model endpoint row ────────────────
+        ep_row = tk.Frame(self, bg=PALETTE["bg"])
+        ep_row.pack(fill="x", padx=20, pady=(10, 0))
+
+        tk.Label(ep_row, text="llama-server endpoint:",
+                 font=("Segoe UI", 9, "bold"),
+                 fg=PALETTE["subtext"], bg=PALETTE["bg"]).pack(side="left", padx=(0, 8))
+
+        tk.Entry(ep_row, textvariable=self._endpoint,
+                 font=("Segoe UI", 9), fg=PALETTE["text"],
+                 bg=PALETTE["card"], bd=0, insertbackground=PALETTE["text"],
+                 relief="flat", width=36,
+                 ).pack(side="left", ipady=4, padx=(0, 8))
+
+        self._ping_lbl = tk.Label(ep_row, text="",
+                                  font=("Segoe UI", 9),
+                                  fg=PALETTE["subtext"], bg=PALETTE["bg"])
+        self._ping_lbl.pack(side="left")
+
+        _make_btn(ep_row, "Test connection", self._test_connection,
+                  PALETTE["ai"]).pack(side="left", padx=(6, 0))
+
+        # ── Folder / file picker row ──────────
+        picker = tk.Frame(self, bg=PALETTE["card"])
+        picker.pack(fill="x", padx=20, pady=(10, 0), ipady=10)
+
+        tk.Label(picker, text="Source:",
+                 font=("Segoe UI", 10, "bold"),
+                 fg=PALETTE["subtext"], bg=PALETTE["card"]).pack(side="left", padx=(14, 6))
+
+        self._folder = tk.StringVar()
+        tk.Entry(picker, textvariable=self._folder,
+                 font=("Segoe UI", 10), fg=PALETTE["text"],
+                 bg=PALETTE["panel"], bd=0, insertbackground=PALETTE["text"],
+                 relief="flat", width=52,
+                 ).pack(side="left", ipady=5, padx=(0, 8), fill="x", expand=True)
+
+        _make_btn(picker, "Browse folder",
+                  self._browse_folder, PALETTE["accent"]).pack(side="left", padx=(0, 4))
+        _make_btn(picker, "Browse files",
+                  self._browse_files,  PALETTE["accent"]).pack(side="left", padx=(0, 6))
+
+        self._recursive = tk.BooleanVar(value=True)
+        tk.Checkbutton(picker, text="Recursive",
+                       variable=self._recursive,
+                       font=("Segoe UI", 9), fg=PALETTE["subtext"],
+                       bg=PALETTE["card"], activebackground=PALETTE["card"],
+                       activeforeground=PALETTE["text"],
+                       selectcolor=PALETTE["panel"],
+                       ).pack(side="left", padx=(0, 14))
+
+        # ── Progress bar ─────────────────────
+        prog_row = tk.Frame(self, bg=PALETTE["bg"])
+        prog_row.pack(fill="x", padx=20, pady=(8, 0))
+
+        ttk.Progressbar(prog_row, variable=self._progress,
+                        maximum=100, mode="determinate",
+                        ).pack(side="left", fill="x", expand=True)
+        tk.Label(prog_row, textvariable=self._status,
+                 font=("Segoe UI", 9), fg=PALETTE["subtext"],
+                 bg=PALETTE["bg"], anchor="w",
+                 ).pack(side="left", padx=(10, 0))
+
+        # ── Results treeview ─────────────────
+        tree_frame = tk.Frame(self, bg=PALETTE["bg"])
+        tree_frame.pack(fill="both", expand=True, padx=20, pady=(12, 0))
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        cols = ("check", "orig", "sugg", "status")
+        self._tree = ttk.Treeview(tree_frame, columns=cols,
+                                  show="headings", selectmode="browse")
+        self._tree.heading("check",  text="✔",           anchor="center")
+        self._tree.heading("orig",   text="Original",    anchor="w")
+        self._tree.heading("sugg",   text="Suggested name (double-click to edit)", anchor="w")
+        self._tree.heading("status", text="Status",      anchor="center")
+
+        self._tree.column("check",  width=36,  minwidth=36,  stretch=False, anchor="center")
+        self._tree.column("orig",   width=280, minwidth=160, stretch=True,  anchor="w")
+        self._tree.column("sugg",   width=280, minwidth=160, stretch=True,  anchor="w")
+        self._tree.column("status", width=110, minwidth=90,  stretch=False, anchor="center")
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self._tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._tree.grid(row=0, column=0, sticky="nsew")
+
+        # Double-click → inline edit of suggested name
+        self._tree.bind("<Double-1>", self._on_double_click)
+        # Single-click on check column → toggle include
+        self._tree.bind("<ButtonRelease-1>", self._on_click)
+
+        # ── Action bar ───────────────────────
+        bar = tk.Frame(self, bg=PALETTE["panel"])
+        bar.pack(fill="x", padx=20, pady=(10, 16))
+
+        tk.Label(bar, text="Actions:",
+                 font=("Segoe UI", 9, "bold"),
+                 fg=PALETTE["subtext"], bg=PALETTE["panel"]).pack(side="left", padx=(14, 10))
+
+        self._scan_btn = _make_btn(bar, "▶  Scan files",
+                                   self._start_scan, PALETTE["accent3"])
+        self._scan_btn.pack(side="left", padx=(0, 6))
+
+        self._stop_btn = _make_btn(bar, "■  Stop",
+                                   self._stop_scan, PALETTE["accent2"])
+        self._stop_btn.pack(side="left", padx=(0, 6))
+        self._stop_btn.configure(state="disabled")
+
+        self._analyse_btn = _make_btn(bar, "🤖  Analyse all",
+                                      self._start_analyse, PALETTE["ai"])
+        self._analyse_btn.pack(side="left", padx=(0, 6))
+        self._analyse_btn.configure(state="disabled")
+
+        self._apply_btn = _make_btn(bar, "✔  Apply renames",
+                                    self._apply_renames, PALETTE["ai_ok"])
+        self._apply_btn.pack(side="left", padx=(0, 6))
+        self._apply_btn.configure(state="disabled")
+
+        self._clear_btn = _make_btn(bar, "🗑  Clear",
+                                    self._clear_all, PALETTE["subtext"])
+        self._clear_btn.pack(side="left")
+
+        tk.Label(bar,
+                 text="Supports: .txt  .pdf  .docx  .pptx",
+                 font=("Segoe UI", 8), fg=PALETTE["subtext"], bg=PALETTE["panel"],
+                 ).pack(side="right", padx=14)
+
+    # ── Connection test ───────────────────────
+
+    def _test_connection(self):
+        endpoint = self._endpoint.get().strip()
+        self._ping_lbl.configure(text="testing…", fg=PALETTE["subtext"])
+        self.update_idletasks()
+        try:
+            url = endpoint.rstrip("/") + "/health"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                r.read()
+            self._ping_lbl.configure(text="✅ connected", fg=PALETTE["ai_ok"])
+        except Exception as e:
+            self._ping_lbl.configure(text=f"❌ {e}", fg=PALETTE["ai_err"])
+
+    # ── Browse ────────────────────────────────
+
+    def _browse_folder(self):
+        folder = filedialog.askdirectory(title="Select folder to scan")
+        if folder:
+            self._folder.set(folder)
+
+    def _browse_files(self):
+        files = filedialog.askopenfilenames(
+            title="Select files",
+            filetypes=[("Supported", "*.txt *.pdf *.docx *.pptx"),
+                       ("All files", "*.*")])
+        if files:
+            # Show parent of first file in the entry, store paths directly
+            self._folder.set(str(Path(files[0]).parent))
+            self._load_file_list(list(files))
+
+    # ── Scan ──────────────────────────────────
+
+    def _start_scan(self):
+        folder = self._folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("No folder", "Please select a valid folder first.")
+            return
+        self._clear_all()
+        self._stop_evt.clear()
+        self._running = True
+        self._scan_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        self._analyse_btn.configure(state="disabled")
+        self._apply_btn.configure(state="disabled")
+        threading.Thread(target=self._scan_worker, args=(folder,), daemon=True).start()
+
+    def _scan_worker(self, folder: str):
+        root = Path(folder)
+        self.after(0, self._status.set, "Scanning for supported files…")
+        try:
+            if self._recursive.get():
+                files = [p for p in root.rglob("*")
+                         if p.is_file() and p.suffix.lower() in AI_RENAME_EXTENSIONS]
+            else:
+                files = [p for p in root.iterdir()
+                         if p.is_file() and p.suffix.lower() in AI_RENAME_EXTENSIONS]
+        except Exception as e:
+            self.after(0, self._status.set, f"Scan error: {e}")
+            self.after(0, self._finish_scan)
+            return
+
+        if not files:
+            self.after(0, self._status.set, "No supported files found (.txt .pdf .docx .pptx).")
+            self.after(0, self._finish_scan)
+            return
+
+        self.after(0, self._load_file_list, [str(f) for f in files])
+        self.after(0, self._status.set, f"Found {len(files)} file(s). Ready to analyse.")
+        self.after(0, self._finish_scan)
+
+    def _load_file_list(self, file_paths: list[str]):
+        self._rows.clear()
+        for child in self._tree.get_children():
+            self._tree.delete(child)
+
+        for fp_str in file_paths:
+            fp  = Path(fp_str)
+            var = tk.BooleanVar(value=True)
+            iid = self._tree.insert("", "end", values=(
+                "☑", fp.name, "—", _STATE_ICONS[_ST_PENDING] + " pending"
+            ))
+            row = {"path": fp, "suggestion": "", "state": _ST_PENDING,
+                   "var": var, "iid": iid}
+            self._rows.append(row)
+            self._tree.tag_configure("pending", foreground=PALETTE["ai_pend"])
+            self._tree.item(iid, tags=("pending",))
+
+        if self._rows:
+            self._analyse_btn.configure(state="normal")
+
+    def _finish_scan(self):
+        self._running = False
+        self._scan_btn.configure(state="normal")
+        self._stop_btn.configure(state="disabled")
+
+    def _stop_scan(self):
+        self._stop_evt.set()
+
+    # ── Analyse ───────────────────────────────
+
+    def _start_analyse(self):
+        pending = [r for r in self._rows if r["state"] in (_ST_PENDING, _ST_ERROR)]
+        if not pending:
+            messagebox.showinfo("Nothing to do", "No pending files to analyse.")
+            return
+        self._stop_evt.clear()
+        self._running = True
+        self._analyse_btn.configure(state="disabled")
+        self._apply_btn.configure(state="disabled")
+        self._scan_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        threading.Thread(target=self._analyse_worker,
+                         args=(pending,), daemon=True).start()
+
+    def _analyse_worker(self, rows: list[dict]):
+        endpoint = self._endpoint.get().strip()
+        total    = len(rows)
+
+        for i, row in enumerate(rows):
+            if self._stop_evt.is_set():
+                self.after(0, self._status.set, f"Stopped at {i}/{total}.")
+                break
+
+            self.after(0, self._progress.set, (i / total) * 100)
+            self.after(0, self._status.set,
+                       f"[{i+1}/{total}]  Analysing {row['path'].name}…")
+            self.after(0, self._set_row_state, row, _ST_RUNNING, "…")
+
+            try:
+                suggestion = ai_rename_file(row["path"], endpoint)
+                row["suggestion"] = suggestion
+                row["state"]      = _ST_DONE
+                self.after(0, self._set_row_state, row, _ST_DONE, suggestion)
+            except Exception as e:
+                row["state"] = _ST_ERROR
+                self.after(0, self._set_row_state, row, _ST_ERROR, str(e)[:60])
+
+        self.after(0, self._progress.set, 100)
+        done  = sum(1 for r in self._rows if r["state"] == _ST_DONE)
+        errs  = sum(1 for r in self._rows if r["state"] == _ST_ERROR)
+        self.after(0, self._status.set,
+                   f"Analysis complete — {done} suggestions, {errs} error(s).")
+        self.after(0, self._finish_analyse)
+
+    def _finish_analyse(self):
+        self._running = False
+        self._scan_btn.configure(state="normal")
+        self._stop_btn.configure(state="disabled")
+        self._analyse_btn.configure(state="normal")
+        has_done = any(r["state"] == _ST_DONE and r["var"].get() for r in self._rows)
+        if has_done:
+            self._apply_btn.configure(state="normal")
+
+    def _set_row_state(self, row: dict, state: str, suggestion: str):
+        color = _STATE_COLORS.get(state, PALETTE["text"])
+        icon  = _STATE_ICONS.get(state, "")
+        check = "☑" if row["var"].get() else "☐"
+        self._tree.item(row["iid"], values=(
+            check, row["path"].name, suggestion, f"{icon} {state}"
+        ))
+        # Re-tag for colour
+        tag = f"state_{state}"
+        self._tree.tag_configure(tag, foreground=color)
+        self._tree.item(row["iid"], tags=(tag,))
+        if suggestion and state == _ST_DONE:
+            row["suggestion"] = suggestion
+
+    # ── Inline edit (double-click on suggestion column) ───────────
+
+    def _on_double_click(self, event):
+        region = self._tree.identify_region(event.x, event.y)
+        col    = self._tree.identify_column(event.x)
+        iid    = self._tree.identify_row(event.y)
+        if region != "cell" or col != "#3" or not iid:
+            return
+
+        row = next((r for r in self._rows if r["iid"] == iid), None)
+        if row is None or row["state"] not in (_ST_DONE, _ST_ERROR):
+            return
+
+        # Get bounding box of the cell
+        x, y, w, h = self._tree.bbox(iid, col)
+
+        current = row["suggestion"]
+        var = tk.StringVar(value=current)
+
+        entry = tk.Entry(self._tree, textvariable=var,
+                         font=("Segoe UI", 9), fg=PALETTE["text"],
+                         bg=PALETTE["sel"], bd=0,
+                         insertbackground=PALETTE["text"], relief="flat")
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        def _commit(evt=None):
+            new_val = _sanitize_suggested_name(var.get())
+            row["suggestion"] = new_val
+            row["state"]      = _ST_DONE
+            self._set_row_state(row, _ST_DONE, new_val)
+            entry.destroy()
+            self._apply_btn.configure(state="normal")
+
+        def _cancel(evt=None):
+            entry.destroy()
+
+        entry.bind("<Return>",  _commit)
+        entry.bind("<Tab>",     _commit)
+        entry.bind("<Escape>",  _cancel)
+        entry.bind("<FocusOut>", _commit)
+
+    # ── Toggle include checkbox (click on check column) ───────────
+
+    def _on_click(self, event):
+        col = self._tree.identify_column(event.x)
+        iid = self._tree.identify_row(event.y)
+        if col != "#1" or not iid:
+            return
+        row = next((r for r in self._rows if r["iid"] == iid), None)
+        if row is None:
+            return
+        row["var"].set(not row["var"].get())
+        check = "☑" if row["var"].get() else "☐"
+        vals = list(self._tree.item(iid, "values"))
+        vals[0] = check
+        self._tree.item(iid, values=vals)
+        # Enable/disable apply based on whether anything is checked+done
+        has_done = any(r["state"] == _ST_DONE and r["var"].get() for r in self._rows)
+        self._apply_btn.configure(state="normal" if has_done else "disabled")
+
+    # ── Apply renames ─────────────────────────
+
+    def _apply_renames(self):
+        targets = [r for r in self._rows
+                   if r["state"] == _ST_DONE and r["var"].get() and r["suggestion"]]
+        if not targets:
+            messagebox.showinfo("Nothing to do",
+                                "No checked files with suggestions to rename.")
+            return
+
+        preview = "\n".join(
+            f"  {r['path'].name}  →  {r['suggestion']}{r['path'].suffix}"
+            for r in targets[:20]
+        )
+        if len(targets) > 20:
+            preview += f"\n  … and {len(targets)-20} more"
+
+        if not messagebox.askyesno("Confirm renames",
+                                   f"Rename {len(targets)} file(s)?\n\n{preview}"):
+            return
+
+        done = 0
+        errors = []
+        for row in targets:
+            new_name = row["suggestion"] + row["path"].suffix
+            new_path = row["path"].parent / new_name
+            # Avoid collision
+            stem, ext = row["suggestion"], row["path"].suffix
+            n = 1
+            while new_path.exists() and new_path.resolve() != row["path"].resolve():
+                new_path = row["path"].parent / f"{stem}_{n}{ext}"
+                n += 1
+            try:
+                row["path"].rename(new_path)
+                row["path"]  = new_path
+                row["state"] = _ST_RENAMED
+                self._set_row_state(row, _ST_RENAMED, row["suggestion"])
+                done += 1
+            except Exception as e:
+                errors.append(f"{row['path'].name}: {e}")
+                row["state"] = _ST_ERROR
+                self._set_row_state(row, _ST_ERROR, str(e)[:60])
+
+        msg = f"✓  {done} file(s) renamed successfully."
+        if errors:
+            msg += f"\n\n✗  {len(errors)} error(s):\n" + "\n".join(f"  • {e}" for e in errors[:10])
+        messagebox.showinfo("Done", msg)
+        self._status.set(f"Renamed {done}/{len(targets)} files.")
+
+    # ── Clear ─────────────────────────────────
+
+    def _clear_all(self):
+        self._rows.clear()
+        for child in self._tree.get_children():
+            self._tree.delete(child)
+        self._progress.set(0)
+        self._status.set("Cleared. Pick a folder or files to begin.")
+        self._analyse_btn.configure(state="disabled")
+        self._apply_btn.configure(state="disabled")
+
+
+# ══════════════════════════════════════════════════════════════════
 # Main application window
 # ══════════════════════════════════════════════════════════════════
 
@@ -1078,6 +1767,7 @@ class MediaSortApp(tk.Tk):
             ("Videos",    "videos",    "🎬"),
             ("Documents", "documents", "📄"),
             ("Audio",     "audio",     "🎵"),
+            ("AI Rename", "airename",  "🤖"),
         ]
         self._tab_btns: dict[str, tk.Button] = {}
 
@@ -1105,12 +1795,14 @@ class MediaSortApp(tk.Tk):
         self._vid_panel  = VideoSorterPanel(self)
         self._doc_panel  = DocumentSorterPanel(self)
         self._aud_panel  = AudioSorterPanel(self)
+        self._ai_panel   = AiRenamePanel(self)
 
         self._panels = {
             "images":    self._img_panel,
             "videos":    self._vid_panel,
             "documents": self._doc_panel,
             "audio":     self._aud_panel,
+            "airename":  self._ai_panel,
         }
 
         def _refresh_tabs():
