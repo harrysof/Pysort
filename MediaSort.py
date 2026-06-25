@@ -516,6 +516,8 @@ class _SorterPanel(tk.Frame):
         self._scanning  = False
         self._moving    = False
         self._stop_flag = threading.Event()
+        self._sort_all_callback = None   # set by MediaSortApp during Sort All
+        self._sort_all_move_callback = None
 
     def _init_results(self):
         self._results = {c: [] for c in self._categories}
@@ -719,9 +721,13 @@ class _SorterPanel(tk.Frame):
             self._set_status(f"Collecting {file_type} files…")
             root = Path(folder)
 
+            known_output_dirs = {root / _safe_folder_name(cat) for cat in self._categories}
+
             if self._recursive.get():
                 all_files = [p for p in root.rglob("*")
-                             if p.is_file() and p.suffix.lower() in self._extensions]
+                             if p.is_file()
+                             and p.suffix.lower() in self._extensions
+                             and not any(p.is_relative_to(d) for d in known_output_dirs)]
             else:
                 all_files = [p for p in root.iterdir()
                              if p.is_file() and p.suffix.lower() in self._extensions]
@@ -782,12 +788,17 @@ class _SorterPanel(tk.Frame):
         st  = "normal" if has else "disabled"
         self._move_btn.configure(state=st)
         self._copy_btn.configure(state=st)
-        if has and self._auto_move.get() and not self._stop_flag.is_set():
+        if self._sort_all_callback:
+            # Sort All mode: hand control back to the orchestrator
+            cb = self._sort_all_callback
+            self._sort_all_callback = None
+            self.after(100, cb, has)
+        elif has and self._auto_move.get() and not self._stop_flag.is_set():
             self.after(200, lambda: self._organize(move=True, silent=True))
 
     # ── Organize ──────────────────────────────
 
-    def _organize(self, move: bool, silent: bool = False):
+    def _organize(self, move: bool, silent: bool = False, silent_finish: bool = False):
         folder = self._folder.get().strip()
         if not folder or self._moving:
             return
@@ -817,9 +828,9 @@ class _SorterPanel(tk.Frame):
         self._scan_btn.configure(state="disabled")
         self._progress.set(0)
 
-        threading.Thread(target=self._move_worker, args=(folder, move), daemon=True).start()
+        threading.Thread(target=self._move_worker, args=(folder, move, silent_finish), daemon=True).start()
 
-    def _move_worker(self, folder: str, move: bool):
+    def _move_worker(self, folder: str, move: bool, silent_finish: bool = False):
         root   = Path(folder)
         verb   = "Moving" if move else "Copying"
         errors: list[str] = []
@@ -865,19 +876,27 @@ class _SorterPanel(tk.Frame):
 
         self.after(0, self._progress.set, 100)
         action = "moved" if move else "copied"
-        lines  = [f"✓  {done} file(s) {action} successfully.\n"]
-        for cat in self._categories:
-            n = len(self._results[cat])
-            if n:
-                lines.append(f"  {self._cat_icons[cat]}  {_safe_folder_name(cat)}/  ← {n} file(s)")
-        if errors:
-            lines.append(f"\n✗  {len(errors)} error(s):")
-            lines.extend(f"   • {e}" for e in errors[:15])
-            if len(errors) > 15:
-                lines.append(f"   … and {len(errors)-15} more.")
 
-        self.after(0, self._set_status, f"Done — {done}/{actual} files {action}.")
-        self.after(0, messagebox.showinfo, "Done", "\n".join(lines))
+        # Store results so Sort All can collect them
+        self._last_move_done   = done
+        self._last_move_actual = actual
+        self._last_move_errors = errors
+        self._last_move_action = action
+
+        if not silent_finish:
+            lines  = [f"✓  {done} file(s) {action} successfully.\n"]
+            for cat in self._categories:
+                n = len(self._results[cat])
+                if n:
+                    lines.append(f"  {self._cat_icons[cat]}  {_safe_folder_name(cat)}/  ← {n} file(s)")
+            if errors:
+                lines.append(f"\n✗  {len(errors)} error(s):")
+                lines.extend(f"   • {e}" for e in errors[:15])
+                if len(errors) > 15:
+                    lines.append(f"   … and {len(errors)-15} more.")
+            self.after(0, self._set_status, f"Done — {done}/{actual} files {action}.")
+            self.after(0, messagebox.showinfo, "Done", "\n".join(lines))
+
         self.after(0, self._finish_move)
 
     def _finish_move(self):
@@ -887,6 +906,10 @@ class _SorterPanel(tk.Frame):
         st  = "normal" if has else "disabled"
         self._move_btn.configure(state=st)
         self._copy_btn.configure(state=st)
+        if self._sort_all_move_callback:
+            cb = self._sort_all_move_callback
+            self._sort_all_move_callback = None
+            self.after(100, cb)
 
     # ── Helpers ───────────────────────────────
 
@@ -1756,6 +1779,16 @@ class MediaSortApp(tk.Tk):
             fg=PALETTE["subtext"], bg=PALETTE["bg"],
         ).pack(side="left", pady=(8, 0))
 
+        self._sort_all_btn = tk.Button(
+            hdr, text="  ⚡  Sort All  ",
+            command=self._start_sort_all,
+            font=("Segoe UI", 10, "bold"),
+            fg=PALETTE["bg"], bg=PALETTE["accent4"],
+            activeforeground=PALETTE["bg"], activebackground=PALETTE["accent4"],
+            relief="flat", bd=0, cursor="hand2", padx=10, pady=5,
+        )
+        self._sort_all_btn.pack(side="right", padx=(0, 0))
+
         # ── Mode switcher ────────────────────────
         switcher = tk.Frame(self, bg=PALETTE["bg"])
         switcher.pack(fill="x", padx=20, pady=(12, 0))
@@ -1817,6 +1850,111 @@ class MediaSortApp(tk.Tk):
                     btn.configure(bg=PALETTE["card"], fg=PALETTE["text"])
 
         _refresh_tabs()   # show images panel by default
+
+    # ── Sort All ──────────────────────────────
+
+    def _start_sort_all(self):
+        """Scan then organise all four media panels in sequence."""
+        # Collect folder from whichever panel is visible; all panels share the same path field
+        # actually each panel has its own _folder — use the currently visible one, or ask.
+        # Use whichever panel already has a folder set
+        folder = ""
+        for panel in (self._img_panel, self._vid_panel, self._doc_panel, self._aud_panel):
+            candidate = panel._folder.get().strip()
+            if candidate and os.path.isdir(candidate):
+                folder = candidate
+                break
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("No folder", "Please select a folder in any tab first.")
+            return
+
+        # Propagate the folder to all four panels so they all point at the same place
+        for panel in (self._img_panel, self._vid_panel, self._doc_panel, self._aud_panel):
+            panel._folder.set(folder)
+
+        if not messagebox.askyesno(
+            "Sort All",
+            f"This will scan and organise all media types inside:\n{folder}\n\n"
+            "Each tab will use its own Move/Copy setting (the 'Auto-move' checkbox).\n\n"
+            "A single summary will be shown at the end.\n\nProceed?"
+        ):
+            return
+
+        self._sort_all_btn.configure(state="disabled", text="  ⏳  Sorting…  ")
+        self._sort_all_summary: list[str] = []
+        self._sort_all_panels  = [
+            ("🖼  Images",    self._img_panel),
+            ("🎬  Videos",    self._vid_panel),
+            ("📄  Documents", self._doc_panel),
+            ("🎵  Audio",     self._aud_panel),
+        ]
+        self._sort_all_index = 0
+        self._sort_all_step_scan()
+
+    def _sort_all_step_scan(self):
+        if self._sort_all_index >= len(self._sort_all_panels):
+            self._sort_all_finish()
+            return
+
+        label, panel = self._sort_all_panels[self._sort_all_index]
+
+        # Switch the visible tab so the user can watch progress
+        tab_key = ["images", "videos", "documents", "audio"][self._sort_all_index]
+        self._mode.set(tab_key)
+        for key, btn in self._tab_btns.items():
+            btn.configure(
+                bg=PALETTE["accent"] if key == tab_key else PALETTE["card"],
+                fg=PALETTE["bg"]     if key == tab_key else PALETTE["text"],
+            )
+        for key, p in self._panels.items():
+            p.pack_forget()
+        self._panels[tab_key].pack(fill="both", expand=True)
+
+        # Register callback: after scan finishes, we decide whether to organise
+        panel._sort_all_callback = self._sort_all_after_scan
+        panel._start_scan()
+
+    def _sort_all_after_scan(self, has_files: bool):
+        label, panel = self._sort_all_panels[self._sort_all_index]
+        file_type    = panel._file_type_label()
+
+        if not has_files:
+            self._sort_all_summary.append(f"{label}: no {file_type} files found — skipped.")
+            self._sort_all_index += 1
+            self._sort_all_step_scan()
+            return
+
+        total = sum(len(v) for v in panel._results.values())
+        move  = panel._auto_move.get()   # respect the tab's own setting
+        verb  = "move" if move else "copy"
+
+        # Register callback for after the move/copy finishes
+        panel._sort_all_move_callback = self._sort_all_after_move
+        panel._organize(move=move, silent=True, silent_finish=True)
+
+    def _sort_all_after_move(self):
+        label, panel = self._sort_all_panels[self._sort_all_index]
+        done   = getattr(panel, "_last_move_done",   0)
+        actual = getattr(panel, "_last_move_actual", 0)
+        action = getattr(panel, "_last_move_action", "processed")
+        errors = getattr(panel, "_last_move_errors", [])
+
+        line = f"{label}: {done}/{actual} files {action}."
+        if errors:
+            line += f" ({len(errors)} error{'s' if len(errors)>1 else ''})"
+        self._sort_all_summary.append(line)
+        for e in errors[:5]:
+            self._sort_all_summary.append(f"     ✗ {e}")
+        if len(errors) > 5:
+            self._sort_all_summary.append(f"     … and {len(errors)-5} more errors.")
+
+        self._sort_all_index += 1
+        self._sort_all_step_scan()
+
+    def _sort_all_finish(self):
+        self._sort_all_btn.configure(state="normal", text="  ⚡  Sort All  ")
+        summary = "\n".join(self._sort_all_summary) if self._sort_all_summary else "Nothing to do."
+        messagebox.showinfo("Sort All — Done", f"All tabs processed.\n\n{summary}")
 
 
 # ══════════════════════════════════════════════════════════════════
